@@ -1,0 +1,988 @@
+
+---CREATING FRAGMENTED TABLE (Claim_A)
+
+CREATE TABLE IF NOT EXISTS Claim_A (
+    ClaimID SERIAL PRIMARY KEY,          -- this  Unique identifier for each claim
+    PolicyID INT NOT NULL,               -- Foreign key referencing the related policy
+    Type VARCHAR(50),                    -- Type of claim (e.g., Accident, Theft, Fire)
+    Status VARCHAR(20),                  -- Current status of the claim (e.g., Pending, Approved, Rejected)
+    ClaimedAmount DECIMAL(10,2)          -- Amount claimed by the policyholder
+);
+
+---INSERTING 5 ROW (PolicyID ≤ 3)
+
+INSERT INTO Claim_A (PolicyID, Type, Status, ClaimedAmount) VALUES
+(1, 'Health', 'Approved', 80000),  -- CLAIMS FOR HEALTH POLICY THAT WAS A. PROVED
+(2, 'Auto', 'Pending', 60000),    -- claims for auto policy that is pending
+(3, 'Home', 'Closed', 90000),    -- Home insurance claims that was closed 
+(1, 'Life', 'Approved', 120000), --- Life insurance claim approved for payout
+(2, 'Travel', 'Approved', 40000); --Travel insurance claim successfully approved
+
+SELECT * FROM Claim_A ;
+
+
+---CREATING FRAGMENTED TABLE (Claim_B)
+CREATE TABLE IF NOT EXISTS Claim_B (
+    ClaimID SERIAL PRIMARY KEY,
+    PolicyID INT NOT NULL,
+    Type VARCHAR(50),
+    Status VARCHAR(20),
+    ClaimedAmount DECIMAL(10,2)
+);
+
+---INSERTING 5 ROW (PolicyID ≤ 3)
+
+INSERT INTO Claim_B (PolicyID, Type, Status, ClaimedAmount) VALUES
+(4, 'Health', 'Approved', 50000),
+(5, 'Home', 'Pending', 70000),
+(6, 'Life', 'Approved', 110000),
+(7, 'Auto', 'Closed', 45000),
+(8, 'Travel', 'Approved', 60000);
+SELECT * FROM Claim_B ;
+-- Enable the dblink extension (only needs to be done once per database)
+-- Establish a connection to the remote database (BranchDB_B)
+-- 'proj_link' is a connection name you can reuse later in queries
+-- Replace connection info with your actual credentials if needed
+
+
+
+CREATE EXTENSION IF NOT EXISTS dblink;
+SELECT dblink_connect(
+    'proj_link',
+    'host=localhost dbname=BranchDB_B user=postgres password=Pas12@gs'
+);
+
+
+
+---On Node_A — Create a Database Link to Node_B
+
+SELECT * 
+FROM dblink(
+    'proj_link',
+    'SELECT ClaimID, PolicyID, Type, Status, ClaimedAmount FROM public.Claim_B'
+) AS t(ClaimID INT, PolicyID INT, Type VARCHAR(50), Status VARCHAR(20), ClaimedAmount DECIMAL(10,2));
+
+--Create the Combined View (Claim_ALL)
+
+CREATE OR REPLACE VIEW Claim_ALL AS
+SELECT ClaimID, PolicyID, Type, Status, ClaimedAmount
+FROM Claim_A
+
+UNION ALL
+
+SELECT ClaimID, PolicyID, Type, Status, ClaimedAmount
+FROM dblink('proj_link', 'SELECT ClaimID, PolicyID, Type, Status, ClaimedAmount FROM Claim_B')
+AS Claim_B(ClaimID INT, PolicyID INT, Type VARCHAR(50), Status VARCHAR(20), ClaimedAmount DECIMAL(10,2));
+
+--Validate with COUNT and CHECKSUM 
+---Count rows on Node_A (local)
+
+SELECT COUNT(*) AS count_a FROM Claim_A;
+
+---Count rows on Node_B (remote)
+
+SELECT COUNT(*) AS count_b
+FROM dblink('proj_link', 'SELECT COUNT(*) FROM Claim_B') AS t(count_b INT);
+
+---Count rows in the unified view
+
+SELECT COUNT(*) AS total_count FROM Claim_ALL;
+
+
+-- ===============================================
+-- 1️⃣ Install dblink extension (if not already installed)
+-- ===============================================
+CREATE EXTENSION IF NOT EXISTS dblink;
+
+
+-- 2️ Create database link 'proj_link' from Node_A to Node_B
+-- Replace host, dbname, user, and password with Node_B details
+-- ===============================================
+SELECT dblink_connect(
+    'proj_link',
+    'host=NODE_B_HOST dbname=NodeBDB user=remote_user password=remote_pass port=5432'
+);
+
+-- ======
+--  Run remote SELECT on Policy@proj_link (up to 5 sample rows)
+SELECT *
+FROM dblink('proj_link', 
+            'SELECT PolicyID, ClientID, AgentID, Type, Premium, StartDate, EndDate, Status FROM Policy LIMIT 5')
+AS Policy_Remote(
+    PolicyID INT,
+    ClientID INT,
+    AgentID INT,
+    Type VARCHAR(50),
+    Premium DECIMAL(10,2),
+    StartDate DATE,
+    EndDate DATE,
+    Status VARCHAR(20)
+);
+
+
+--  Run a distributed join: local Claim_A joined with remote Agent@proj_link
+--    Includes selective predicates to keep row count between 3–10
+-- ===============================================
+SELECT 
+    c.ClaimID,
+    c.PolicyID,
+    c.Type AS ClaimType,
+    c.Status AS ClaimStatus,
+    c.ClaimedAmount,
+    a.FullName AS AgentName,
+    a.Contact AS AgentContact,
+    a.Branch AS AgentBranch
+FROM Claim_A c
+JOIN dblink(
+        'proj_link', 
+        'SELECT AgentID, FullName, Contact, Branch, Experience FROM Agent WHERE Experience >= 2 LIMIT 5'
+     ) 
+     AS a(
+         AgentID INT, 
+         FullName VARCHAR(100), 
+         Contact VARCHAR(50), 
+         Branch VARCHAR(100), 
+         Experience INT
+     )
+ON c.PolicyID = a.AgentID  -- adjust join condition based on schema
+WHERE c.ClaimedAmount > 50000; -- selective predicate to control row count
+
+-- ===============================================
+-- 5️⃣ Optional: Disconnect the database link after queries
+-- ===============================================
+SELECT dblink_disconnect('proj_link');
+
+
+--A3
+-- ========================================================
+-- 1️⃣ SERIAL AGGREGATION ON Claim_ALL
+-- ========================================================
+-- 1️⃣ SERIAL AGGREGATION
+SET max_parallel_workers_per_gather = 0;
+
+
+SELECT table_schema, table_name, table_type
+FROM information_schema.tables
+WHERE table_name ILIKE 'claim_all';
+
+
+-- 2️PARALLEL AGGREGATION
+SET max_parallel_workers_per_gather = 8;
+
+-- 3️ MANUAL COMPARISON TABLE
+-- Fill in based on EXPLAIN ANALYZE output
+SELECT 'Serial' AS Execution_Type, '5–10' AS Total_Rows, 
+       'Aggregate node; single worker; no parallelism' AS Plan_Notes
+UNION ALL
+SELECT 'Parallel', '5–10', 
+       'Gather + Parallel Seq Scan + Parallel Aggregate; may still be serial on small dataset';
+
+-- Clear previous stats
+-- ALTER SESSION SET STATISTICS_LEVEL = ALL;
+
+-- Run query with execution plan and actual runtime statistics
+-- Force SERIAL execution
+SET max_parallel_workers_per_gather = 0;
+
+-- Force PARALLEL execution
+SET max_parallel_workers_per_gather = 8;  -- or desired number of workers
+
+SET max_parallel_workers_per_gather = 0;
+
+-- PARALLEL execution
+SET max_parallel_workers_per_gather = 8;
+
+
+
+
+-- 2️ PARALLEL AGGREGATION ON Claim_ALL
+-- Enable parallel execution and allow up to 8 parallel workers
+ALTER SESSION ENABLE PARALLEL DML;
+ALTER SESSION FORCE PARALLEL_QUERY PARALLEL 8;
+
+-- Run parallel aggregation and capture cursor
+VAR parallel_cursor NUMBER;
+BEGIN
+    OPEN :parallel_cursor FOR
+    SELECT /*+ PARALLEL(Claim_A,8) PARALLEL(Claim_B,8) */
+           Type, SUM(ClaimedAmount) AS total_claim
+    FROM Claim_ALL
+    GROUP BY Type
+    ORDER BY Type;
+END;
+/
+
+-- Display execution plan and stats for parallel
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(FORMAT => 'ALLSTATS LAST'));
+
+--- PRODUCE COMPARISON TABLE (SERIAL vs PARALLEL)
+
+-- Example: manually create comparison notes
+-- In practice, you may populate this from your DBMS_XPLAN output
+SELECT 'Serial' AS Execution_Type, '5–10' AS Total_Rows, 
+       'HashAggregate; single worker; no parallelism' AS Plan_Notes
+FROM dual
+UNION ALL
+SELECT 'Parallel' AS Execution_Type, '5–10' AS Total_Rows, 
+       'Parallel HashAggregate; Gather node; may still execute serially on small dataset' AS Plan_Notes
+FROM dual;
+
+---A4
+
+
+-- Load dblink extension
+-
+CREATE EXTENSION IF NOT EXISTS dblink;
+
+-
+-- 1️ Ensure local table exists
+
+CREATE TABLE IF NOT EXISTS Claim_A (
+    ClaimID SERIAL PRIMARY KEY,
+    PolicyID INT NOT NULL,
+    Type VARCHAR(50),
+    Status VARCHAR(20),
+    ClaimedAmount DECIMAL(10,2)
+);
+
+
+-- 2️ Ensure remote table exists on Node_B
+-- Example: Payment table
+
+-- Use dblink to create remote table (if needed)
+-- SELECT dblink_exec('proj_link', 
+--     'CREATE TABLE IF NOT EXISTS Payment (
+--         PaymentID SERIAL PRIMARY KEY,
+--         PolicyID INT,
+--         Amount DECIMAL(10,2)
+--     )'
+-- );
+
+-- ====================================================
+-- 3️ CLEAN 2PC INSERT BLOCK (one local + one remote)
+-- ====================================================
+DO $$
+DECLARE
+    local_txid TEXT := 'tx_local_' || clock_timestamp();
+    remote_txid TEXT := 'tx_remote_' || clock_timestamp();
+BEGIN
+    -- Local transaction
+    INSERT INTO Claim_A (PolicyID, Type, Status, ClaimedAmount)
+    VALUES (10, 'Health', 'Pending', 5000);
+
+    -- Remote transaction via dblink, prepare
+    PERFORM dblink_exec('proj_link',
+        'BEGIN; ' ||
+        'INSERT INTO Payment (PolicyID, Amount) VALUES (10, 5000); ' ||
+        'PREPARE TRANSACTION ''' || remote_txid || ''';'
+    );
+
+    -- Prepare local transaction
+    PREPARE TRANSACTION local_txid;
+
+    -- Commit both prepared transactions (2PC)
+    COMMIT PREPARED local_txid;
+    PERFORM dblink_exec('proj_link',
+        'COMMIT PREPARED ''' || remote_txid || ''';');
+
+END
+$$;
+
+-- ====================================================
+-- 4️⃣ Simulate FAILURE (second run with disabled link)
+-- ====================================================
+-- For simulation, comment out remote commit or break dblink
+-- This will create an in-doubt transaction on Node_A or Node_B
+DO $$
+DECLARE
+    local_txid TEXT := 'tx_local_fail_' || clock_timestamp();
+    remote_txid TEXT := 'tx_remote_fail_' || clock_timestamp();
+BEGIN
+    INSERT INTO Claim_A (PolicyID, Type, Status, ClaimedAmount)
+    VALUES (11, 'Auto', 'Pending', 6000);
+
+    -- Remote insert (simulate failure by not completing commit)
+    PERFORM dblink_exec('proj_link',
+        'BEGIN; ' ||
+        'INSERT INTO Payment (PolicyID, Amount) VALUES (11, 6000); ' ||
+        'PREPARE TRANSACTION ''' || remote_txid || ''';'
+    );
+
+    -- Prepare local transaction (it remains in-doubt)
+    PREPARE TRANSACTION local_txid;
+
+    -- At this point, both local and remote are in-doubt
+END
+$$;
+
+-
+-- CHECK PENDING 2PC TRANSACTIONS
+
+SELECT * FROM pg_prepared_xacts;
+
+-- ====================================================
+-- 6️⃣ FORCE RESOLVE (COMMIT or ROLLBACK)
+-- ====================================================
+-- Example: Rollback the in-doubt transactions to stay within row budget
+ROLLBACK PREPARED 'tx_local_fail_2025-10-28 19:xx:xx';  -- replace timestamp
+SELECT dblink_exec('proj_link', 'ROLLBACK PREPARED ''tx_remote_fail_2025-10-28 19:xx:xx'';');
+
+-- ====================================================
+-- 7️⃣ VERIFY FINAL CONSISTENCY
+-- ====================================================
+-- Local check
+SELECT * FROM Claim_A WHERE PolicyID IN (10,11);
+
+-- Remote check
+SELECT * FROM dblink('proj_link', 'SELECT * FROM Payment WHERE PolicyID IN (10,11)')
+AS t(PaymentID INT, PolicyID INT, Amount DECIMAL);
+
+-- ====================================================
+-- 8️⃣ CLEAN RUN AGAIN (optional, no pending tx)
+-- ====================================================
+-- Re-run step 3 if needed to confirm all is clean
+
+-- Check prepared transactions
+SELECT * FROM pg_prepared_xacts;
+-- Force commit or rollback
+COMMIT PREPARED 'tx_local_...';
+-- or
+ROLLBACK PREPARED 'tx_local_...';
+
+-- Use dblink to COMMIT/ROLLBACK prepared
+SELECT dblink_exec('proj_link', 'COMMIT PREPARED ''tx_remote_...'';');
+
+-- Local check
+SELECT * FROM Claim_A WHERE PolicyID=4;
+
+-- Remote check via dblink
+SELECT * FROM dblink('proj_link', 'SELECT * FROM Payment WHERE PolicyID=4')
+AS t(PaymentID INT, PolicyID INT, Amount DECIMAL);
+
+---A5
+
+-- On Node_A (run in a psql session)
+CREATE TABLE IF NOT EXISTS Claim_A (
+    ClaimID SERIAL PRIMARY KEY,
+    PolicyID INT NOT NULL,
+    Type VARCHAR(50),
+    Status VARCHAR(20),
+    ClaimedAmount DECIMAL(10,2)
+);
+
+-- Ensure a row exists to reuse (ClaimID = 1)
+INSERT INTO Claim_A (PolicyID, Type, Status, ClaimedAmount)
+SELECT 1, 'Health', 'Approved', 80000
+WHERE NOT EXISTS (SELECT 1 FROM Claim_A WHERE ClaimID = 1);
+
+-- On Node_B: create extension & ensure proj_link exists (run once)
+CREATE EXTENSION IF NOT EXISTS dblink;
+
+-- If you haven't already created proj_link, run this (replace placeholders):
+-- SELECT dblink_connect('proj_link', 'host=NODE_A_HOST dbname=NodeA_DB user=some_user password=secret port=5432');
+
+-- SESSION 2 (Node_B) - attempt to update the same row on Node_A via dblink
+-- This call will BLOCK until Session 1 releases the lock.
+SELECT now() AS attempt_time;
+SELECT dblink_exec(
+    'proj_link',
+    $sql$
+      BEGIN;
+      UPDATE Claim_A SET Status = 'UPDATED_BY_S2' WHERE ClaimID = 1;
+      -- don't commit here — this statement will block waiting for Session 1's lock to release
+      COMMIT;
+    $sql$
+) AS result;
+
+-- 1) View current locks and who is waiting
+-- Shows pg_locks joined to pg_stat_activity
+SELECT
+  a.pid AS pid,
+  a.usename,
+  a.state,
+  a.query AS active_query,
+  l.locktype,
+  l.mode,
+  l.granted
+FROM pg_locks l
+JOIN pg_stat_activity a ON l.pid = a.pid
+WHERE (l.locktype IN ('tuple','relation') OR l.mode LIKE '%Exclusive%')
+ORDER BY a.pid;
+
+-- 2) Show waiters vs blockers (blocking_pid is in pg_stat_activity.waiting? In PG12+ use wait_event_type/wait_event)
+-- A typical approach: see which backends are waiting and which are blocking
+SELECT
+  blocked.pid AS blocked_pid,
+  blocked.query AS blocked_query,
+  blocking.pid AS blocking_pid,
+  blocking.query AS blocking_query
+FROM pg_stat_activity blocked
+JOIN pg_locks bl ON blocked.pid = bl.pid AND NOT bl.granted
+JOIN pg_locks kl ON (bl.locktype = kl.locktype AND bl.database IS NOT DISTINCT FROM kl.database AND bl.relation IS NOT DISTINCT FROM kl.relation)
+JOIN pg_stat_activity blocking ON kl.pid = blocking.pid AND kl.granted
+WHERE blocked.pid <> blocking.pid
+  AND blocked.query IS NOT NULL
+  AND blocking.query IS NOT NULL;
+
+
+  RAISE NOTICE 'pg_stat_activity rows for dblink connections:';
+SELECT pid, usename, application_name, state, query_start, query
+FROM pg_stat_activity
+WHERE application_name LIKE 'dblink%' OR query LIKE '%Claim_A%' OR query LIKE '%LOCKED_BY_S1%' OR query LIKE '%UPDATED_BY_S2%';
+
+-- 7) Now release the lock by committing the transaction on 's1'.
+--    This should allow the previously-blocked 's2' update to proceed and complete.
+PERFORM dblink_exec('s1', 'COMMIT;');
+
+RAISE NOTICE 'Session1 (s1) COMMITed; the blocked Session2 (s2) should now complete.';
+
+---BB
+-- === CLAIM TABLE CONSTRAINTS ===
+ALTER TABLE Claim
+    ALTER COLUMN PolicyID SET NOT NULL,
+    ALTER COLUMN ClaimedAmount SET NOT NULL;
+
+ALTER TABLE Claim
+    ADD CONSTRAINT chk_claim_amount_positive
+        CHECK (ClaimedAmount > 0),
+    ADD CONSTRAINT chk_claim_status_valid
+        CHECK (Status IN ('Pending','Approved','Closed','Rejected')),
+    ADD CONSTRAINT chk_claim_date_order
+        CHECK (DateFiled <= CURRENT_DATE);
+
+-- === PAYMENT TABLE CONSTRAINTS ===
+ALTER TABLE Payment
+    ALTER COLUMN ClaimID SET NOT NULL,
+    ALTER COLUMN Amount SET NOT NULL,
+    ALTER COLUMN PaymentDate SET NOT NULL,
+    ALTER COLUMN Method SET NOT NULL;
+
+ALTER TABLE Payment
+    ADD CONSTRAINT chk_payment_amount_positive
+        CHECK (Amount > 0),
+    ADD CONSTRAINT chk_payment_method_valid
+        CHECK (Method IN ('Bank Transfer','Mobile Money','Cheque')),
+    ADD CONSTRAINT chk_payment_date_order
+        CHECK (PaymentDate >= DATE '2025-01-01' AND PaymentDate <= CURRENT_DATE);
+
+---Prepare test INSERTs (2 pass + 2 fail per table)
+
+-- ======== CLAIM TESTING ====
+
+
+DO $$
+BEGIN
+    RAISE NOTICE '--- Testing Payment inserts ---';
+
+    --  PASSING INSERTS
+    INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+    VALUES (1, 40000, CURRENT_DATE, 'Mobile Money');
+
+    INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+    VALUES (2, 70000, CURRENT_DATE, 'Bank Transfer');
+
+    -- ❌ FAILING 1: negative Amount
+    BEGIN
+        INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+        VALUES (3, -5000, CURRENT_DATE, 'Cheque');
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'ERROR: %', SQLERRM;
+        ROLLBACK;
+        BEGIN;
+    END;
+    -- ❌ FAILING 2: invalid Method
+    BEGIN
+        INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+        VALUES (4, 120000, CURRENT_DATE, 'Cash');
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'ERROR: %', SQLERRM;
+        ROLLBACK;
+        BEGIN;
+    END;
+
+    COMMIT;
+END $$;
+
+-- ======== PAYMENT TESTING ========
+DO $$
+BEGIN
+    RAISE NOTICE '--- Testing Payment inserts ---';
+
+    --  PASSING INSERTS
+    INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+    VALUES (1, 40000, CURRENT_DATE, 'Mobile Money');
+
+    INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+    VALUES (2, 70000, CURRENT_DATE, 'Bank Transfer');
+
+    -- ❌ FAILING 1: negative Amount
+    BEGIN
+        INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+        VALUES (3, -5000, CURRENT_DATE, 'Cheque');
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'ERROR: %', SQLERRM;
+        ROLLBACK;
+        BEGIN;
+    END;
+
+    -- ❌ FAILING 2: invalid Method
+    BEGIN
+        INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+        VALUES (4, 120000, CURRENT_DATE, 'Cash');
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'ERROR: %', SQLERRM;
+        ROLLBACK;
+        BEGIN;
+    END;
+
+    COMMIT;
+END $$;
+
+-- Counts
+SELECT
+  (SELECT COUNT(*) FROM Claim)   AS claim_rows,
+  (SELECT COUNT(*) FROM Payment) AS payment_rows;
+
+-- Show new valid rows
+SELECT ClaimID, PolicyID, Status, ClaimedAmount FROM Claim ORDER BY ClaimID DESC LIMIT 5;
+SELECT PaymentID, ClaimID, Amount, Method FROM Payment ORDER BY PaymentID DESC LIMIT 5;
+
+
+-- B7: Trigger for Denormalized Totals (Claim / Payment)
+-- ==============================================
+
+-- 1️Create audit table
+DROP TABLE IF EXISTS Claim_AUDIT CASCADE;
+
+CREATE TABLE Claim_AUDIT (
+    audit_id SERIAL PRIMARY KEY,
+    bef_total DECIMAL(12,2),
+    aft_total DECIMAL(12,2),
+    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    key_col VARCHAR(64)
+);
+
+-- 2️ Ensure both Claim and Payment exist
+-- (Skip this section if they already exist in your database)
+-- Just shown for completeness
+CREATE TABLE IF NOT EXISTS Claim (
+    ClaimID SERIAL PRIMARY KEY,
+    PolicyID INT,
+    Type VARCHAR(50),
+    Status VARCHAR(20),
+    ClaimedAmount DECIMAL(10,2)
+);
+
+CREATE TABLE IF NOT EXISTS Payment (
+    PaymentID SERIAL PRIMARY KEY,
+    ClaimID INT REFERENCES Claim(ClaimID) ON DELETE CASCADE,
+    Amount DECIMAL(10,2),
+    PaymentDate DATE,
+    Method VARCHAR(20)
+);
+
+-- 3️ Trigger function to recompute totals
+CREATE OR REPLACE FUNCTION trg_recompute_claim_totals()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_bef_total DECIMAL(12,2);
+    v_aft_total DECIMAL(12,2);
+BEGIN
+    -- compute totals before this statement (sum of all Payment amounts)
+    SELECT COALESCE(SUM(Amount),0) INTO v_bef_total FROM Payment;
+
+    -- wait for the statement operation to complete
+    -- no explicit operation here; totals are recomputed after the DML executes
+
+    -- recompute total payments and update each Claim’s ClaimedAmount (denormalized)
+    UPDATE Claim c
+    SET ClaimedAmount = COALESCE((
+        SELECT SUM(p.Amount)
+        FROM Payment p
+        WHERE p.ClaimID = c.ClaimID
+    ), 0);
+
+    -- compute totals after update
+    SELECT COALESCE(SUM(Amount),0) INTO v_aft_total FROM Payment;
+
+    -- log before/after totals into audit table
+    INSERT INTO Claim_AUDIT (bef_total, aft_total, key_col)
+    VALUES (v_bef_total, v_aft_total, TG_OP);
+
+    RETURN NULL; -- statement-level triggers always return null
+END;
+$$ LANGUAGE plpgsql;
+
+-- 4️Create the AFTER statement-level trigger on Payment
+DROP TRIGGER IF EXISTS trg_payment_totals ON Payment;
+-- 4️ Drop any old triggers
+DROP TRIGGER IF EXISTS trg_payment_insert_totals ON Payment;
+DROP TRIGGER IF EXISTS trg_payment_update_totals ON Payment;
+DROP TRIGGER IF EXISTS trg_payment_delete_totals ON Payment;
+
+-- Create separate statement-level triggers (no transition tables)
+CREATE TRIGGER trg_payment_insert_totals
+AFTER INSERT ON Payment
+FOR EACH STATEMENT
+EXECUTE FUNCTION trg_recompute_claim_totals();
+
+CREATE TRIGGER trg_payment_update_totals
+AFTER UPDATE ON Payment
+FOR EACH STATEMENT
+EXECUTE FUNCTION trg_recompute_claim_totals();
+
+CREATE TRIGGER trg_payment_delete_totals
+AFTER DELETE ON Payment
+FOR EACH STATEMENT
+EXECUTE FUNCTION trg_recompute_claim_totals();
+
+CREATE TRIGGER trg_payment_totals
+AFTER INSERT OR UPDATE OR DELETE
+ON Payment
+REFERENCING OLD TABLE AS oldtbl NEW TABLE AS newtbl
+FOR EACH STATEMENT
+EXECUTE FUNCTION trg_recompute_claim_totals();
+
+
+--Small DML test set (affects ≤ 4 total rows)
+
+-- (Insert small sample parent rows if not already present)
+ALTER TABLE Claim
+DROP CONSTRAINT IF EXISTS chk_claim_amount_positive,
+ADD CONSTRAINT chk_claim_amount_nonnegative CHECK (ClaimedAmount >= 0);
+
+INSERT INTO Claim (PolicyID, Type, Status, ClaimedAmount)
+VALUES 
+    (1, 'Health', 'Approved', 0),
+    (2, 'Auto', 'Approved', 0)
+ON CONFLICT DO NOTHING;
+
+-- Insert 2 payment rows
+ALTER TABLE Payment
+DROP CONSTRAINT IF EXISTS payment_claimid_key;
+
+INSERT INTO Payment (ClaimID, Amount, PaymentDate, Method)
+VALUES 
+    (1, 50000, CURRENT_DATE, 'Bank Transfer'),
+    (2, 70000, CURRENT_DATE, 'Mobile Money');
+
+-- Update 1 payment row
+UPDATE Payment
+SET Amount = 60000
+WHERE ClaimID = 1;
+
+
+-- Delete 1 payment row
+DELETE FROM Payment WHERE ClaimID = 2;
+
+COMMIT;
+
+-- 6️ Verification queries
+-- ==============================================
+
+-- Show current totals in Claim after trigger recomputation
+SELECT ClaimID, PolicyID, ClaimedAmount AS total_claim_amount
+FROM Claim
+ORDER BY ClaimID;
+
+-- Show audit trail (2–3 rows expected)
+SELECT audit_id, bef_total, aft_total, key_col, changed_at
+FROM Claim_AUDIT
+ORDER BY audit_id;
+
+-- Verify current total payments (for reference)
+SELECT SUM(Amount) AS total_payment_amount FROM Payment;
+
+SELECT * FROM Payment ;
+SELECT * FROM Claim;
+
+
+
+-- B8 : Recursive Hierarchy Roll-Up (6–10 rows total)
+-- =========================================================
+
+-- 1️Create the hierarchy table (Domain: Insurance Branch → Agent → Claim)
+DROP TABLE IF EXISTS HIER CASCADE;
+
+CREATE TABLE HIER (
+    parent_id INT,
+    child_id INT
+);
+
+-- 2️ Insert 6–10 rows forming a 3-level hierarchy
+-- Level 1: Root branches (Kigali, Musanze)
+-- Level 2: Agents under branches
+-- Level 3: Claims under agents (reuse existing ClaimIDs)
+
+INSERT INTO HIER (parent_id, child_id) VALUES
+    (NULL, 1),  -- 1 = Kigali branch (root)
+    (NULL, 2),  -- 2 = Musanze branch (root)
+    (1, 3),     -- Agent A under Kigali
+    (1, 4),     -- Agent B under Kigali
+    (2, 5),     -- Agent C under Musanze
+    (3, 101),   -- Claim 101 under Agent A
+    (3, 102),   -- Claim 102 under Agent A
+    (4, 103),   -- Claim 103 under Agent B
+    (5, 104);   -- Claim 104 under Agent C
+
+
+-- (Total: 9 rows → within allowed limit)
+
+COMMIT;
+
+
+-- 3️ Recursive WITH query to derive full hierarchy
+
+WITH RECURSIVE HierarchyCTE AS (
+    -- Base level: start with all root nodes (branches)
+    SELECT 
+        child_id AS node_id,
+        child_id AS root_id,
+        1 AS depth
+    FROM HIER
+    WHERE parent_id IS NULL
+
+    UNION ALL
+    -- Recursive step: attach children to their parent
+    SELECT 
+        h.child_id AS node_id,
+        cte.root_id AS root_id,
+        cte.depth + 1 AS depth
+    FROM HIER h
+    JOIN HierarchyCTE cte ON h.parent_id = cte.node_id
+)
+SELECT * FROM HierarchyCTE
+ORDER BY root_id, depth;
+
+---Roll-up totals by root branch
+
+WITH RECURSIVE HierarchyCTE AS (
+    SELECT child_id AS node_id, child_id AS root_id, 1 AS depth
+    FROM HIER
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT h.child_id AS node_id, cte.root_id, cte.depth + 1
+    FROM HIER h
+    JOIN HierarchyCTE cte ON h.parent_id = cte.node_id
+)
+SELECT 
+    cte.root_id AS branch_id,
+    SUM(c.ClaimedAmount) AS total_claimed
+FROM HierarchyCTE cte
+JOIN Claim c ON c.ClaimID = cte.node_id
+GROUP BY cte.root_id
+ORDER BY cte.root_id;
+
+
+SELECT ClaimID, ClaimedAmount FROM Claim WHERE ClaimID IN (101,102,103,104);
+
+
+-- B9 : Mini-Knowledge Base with Transitive Inference (≤10 facts)
+-- =========================================================
+
+-- 1 Create table TRIPLE
+DROP TABLE IF EXISTS TRIPLE CASCADE;
+
+CREATE TABLE TRIPLE (
+    s VARCHAR(64),   -- subject
+    p VARCHAR(64),   -- predicate
+    o VARCHAR(64)    -- object
+);
+
+-- 2️Insert 8–10 simple domain facts (insurance domain)
+-- Each row = (subject, predicate, object)
+-- Example: ("HealthPolicy" isA "Policy"), ("Policy" covers "Client"), etc.
+INSERT INTO TRIPLE (s, p, o) VALUES
+    ('HealthPolicy', 'isA', 'Policy'),
+    ('AutoPolicy',   'isA', 'Policy'),
+    ('Policy',       'isA', 'InsuranceProduct'),
+    ('InsuranceProduct', 'isA', 'Service'),
+    ('Claim',        'isA', 'Request'),
+    ('Request',      'isA', 'Record'),
+    ('Policy',       'covers', 'Client'),
+    ('Claim',        'references', 'Policy'),
+    ('Payment',      'settles', 'Claim');
+
+COMMIT;
+
+
+-- 3️ Recursive inference query for transitive isA*
+-- =========================================================
+
+WITH RECURSIVE isA_chain AS (
+    -- Base case: direct isA facts
+    SELECT s, o AS superclass, 1 AS depth
+    FROM TRIPLE
+    WHERE p = 'isA'
+
+    UNION ALL
+
+    -- Recursive case: follow isA links transitively
+    SELECT c.s, t.o AS superclass, c.depth + 1
+    FROM isA_chain c
+    JOIN TRIPLE t ON c.superclass = t.s
+    WHERE t.p = 'isA'
+)
+SELECT DISTINCT
+    s AS entity,
+    superclass AS inferred_type,
+    depth
+FROM isA_chain
+ORDER BY entity, depth;
+
+
+-- 4️ Optional labeled inference query (combine base + derived)
+-- =========================================================
+
+WITH RECURSIVE full_isA AS (
+    SELECT s, o AS superclass, 1 AS depth
+    FROM TRIPLE
+    WHERE p = 'isA'
+    UNION ALL
+    SELECT f.s, t.o AS superclass, f.depth + 1
+    FROM full_isA f
+    JOIN TRIPLE t ON f.superclass = t.s
+    WHERE t.p = 'isA'
+)
+SELECT DISTINCT
+    s AS entity,
+    superclass AS inferred_type,
+    CASE 
+        WHEN depth = 1 THEN 'Direct Type'
+        ELSE 'Inferred Type'
+    END AS relation_level,
+    depth
+FROM full_isA
+ORDER BY s, depth;
+
+
+-- 5️ Validation (grouping and counts)
+
+-- Count how many inferred types each entity has
+WITH RECURSIVE full_isA AS (
+    SELECT s, o AS superclass, 1 AS depth
+    FROM TRIPLE
+    WHERE p = 'isA'
+    UNION ALL
+    SELECT f.s, t.o AS superclass, f.depth + 1
+    FROM full_isA f
+    JOIN TRIPLE t ON f.superclass = t.s
+    WHERE t.p = 'isA'
+)
+SELECT s AS entity, COUNT(DISTINCT superclass) AS num_inferred_types
+FROM full_isA
+GROUP BY s
+ORDER BY s;
+
+===B19
+
+--Create BUSINESS LIMIT
+
+CREATE TABLE BUSINESS_LIMITS (
+    rule_key VARCHAR(64) PRIMARY KEY,
+    threshold NUMERIC(10,2) NOT NULL,
+    active CHAR(1) NOT NULL CHECK (active IN ('Y','N'))
+);
+
+-- Seed exactly one active rule: total Payment.Amount must not exceed 15000
+INSERT INTO BUSINESS_LIMITS(rule_key, threshold, active)
+SELECT 'TOTAL_PAYMENT_LIMIT', 15000, 'Y'
+WHERE NOT EXISTS (SELECT 1 FROM BUSINESS_LIMITS WHERE rule_key='TOTAL_PAYMENT_LIMIT');
+
+
+---Create the function to check limit
+
+CREATE OR REPLACE FUNCTION fn_should_alert(new_amount NUMERIC)
+RETURNS INT AS $$
+DECLARE
+    total_payment NUMERIC;
+    limit_threshold NUMERIC;
+BEGIN
+  -- Read the active limit
+    SELECT threshold INTO limit_threshold
+    FROM BUSINESS_LIMITS
+    WHERE active = 'Y'
+    LIMIT 1;
+
+  -- Sum existing Payment amounts
+    SELECT COALESCE(SUM(amount),0) INTO total_payment
+    FROM Payment;
+
+  -- Check if inserting new_amount would exceed the threshold
+    IF total_payment + new_amount > limit_threshold THEN
+        RETURN 1; -- violation
+    ELSE
+        RETURN 0; -- no violation
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+--- Create TRIGGER BEFORE INSERT 
+
+CREATE OR REPLACE FUNCTION trg_payment_limit()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF fn_should_alert(NEW.Amount) = 1 THEN
+        RAISE EXCEPTION 'Business limit exceeded: cannot insert/update Payment of amount %', NEW.Amount;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach trigger to Payment table
+CREATE TRIGGER payment_limit_alert
+BEFORE INSERT OR UPDATE ON Payment
+FOR EACH ROW
+EXECUTE FUNCTION trg_payment_limit();
+
+---Demonstrate 2 failing and 2 passing DMLs
+CREATE TABLE Payment (
+    "PaymentID" SERIAL PRIMARY KEY,
+    "PolicyID" INT NOT NULL,
+    "Amount" NUMERIC(10,2)
+);
+
+
+-- Passing DML #1
+CREATE TABLE IF NOT EXISTS payment (
+    paymentid SERIAL PRIMARY KEY,
+    policyid INT NOT NULL,
+    amount NUMERIC(10,2)
+);
+
+INSERT INTO payment (policyid, amount) VALUES (3, 2000);  -- total = 5000+4000+2000 = 11000
+
+--  Passing DML #2
+
+INSERT INTO Payment (PolicyID, Amount) VALUES (4, 3000);  -- total = 11000+3000 = 14000
+
+-- ❌ Failing DML #1
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO Payment (PolicyID, Amount) VALUES (5, 2000);  -- would exceed 15000
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'Expected failure: %', SQLERRM;
+        ROLLBACK;  -- rollback the failing DML
+    END;
+END$$;
+
+-- ❌ Failing DML #2
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO Payment (PolicyID, Amount) VALUES (6, 2000);  -- would exceed 15000
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'Expected failure: %', SQLERRM;
+        ROLLBACK;
+    END;
+END$$;
+
+
+---Verify resulting committed data
+
+SELECT * FROM Payment ORDER BY PaymentID;
+
+
+
+

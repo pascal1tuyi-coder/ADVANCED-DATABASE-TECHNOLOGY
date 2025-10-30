@@ -1,0 +1,132 @@
+
+
+TUYISHIME Pascal                                              29th October 2025
+Reg No:  224019442
+Year of Study: 2
+UR-CBE Gikondo Campus
+African Center of Excellence in Data Science (ACE-DS)
+Masters of Data Science in Mining
+________________________________________
+
+Case Study: 
+Distributed PostgreSQL Database Project
+
+Overview
+
+This project demonstrates how PostgreSQL can be used to manage a distributed insurance database across multiple nodes using:
+* Data fragmentation
+* Database links (dblink)
+* Two-phase commit (2PC)
+* Parallel query execution
+* Recursive inference
+Two databases — BranchDB_A and BranchDB_B — simulate distributed nodes for an insurance company.
+
+
+1. Creating Fragmented Tables
+
+CREATE TABLE IF NOT EXISTS Claim_A (
+    ClaimID SERIAL PRIMARY KEY,
+    PolicyID INT NOT NULL,
+    Type VARCHAR(50),
+    Status VARCHAR(20),
+    ClaimedAmount DECIMAL(10,2)
+);
+
+Tables are fragmented horizontally between two nodes (Claim_A on Node_A, and Claim_B on Node_B).
+
+
+2. Connecting Remote Databases using dblink
+
+CREATE EXTENSION IF NOT EXISTS dblink;
+SELECT dblink_connect('proj_link','host=localhost dbname=BranchDB_B user=postgres password=Pas12@gs');
+
+The above codes means dblink extension enables communication between databases on different nodes.
+
+
+3. Unified Distributed View
+
+CREATE OR REPLACE VIEW Claim_ALL AS
+SELECT * FROM Claim_A
+UNION ALL
+SELECT * FROM dblink('proj_link',
+  'SELECT ClaimID, PolicyID, Type, Status, ClaimedAmount FROM Claim_B')
+AS Claim_B(ClaimID INT, PolicyID INT, Type VARCHAR(50), Status VARCHAR(20), ClaimedAmount DECIMAL(10,2));
+
+The local and remote fragments can be merged  with a UNION ALL (combines multiple result sets without removing duplicates) view:
+
+
+4. Distributed Transaction (Two-Phase Commit)
+
+DO $$
+DECLARE
+    local_txid TEXT := 'tx_local_' || clock_timestamp();
+    remote_txid TEXT := 'tx_remote_' || clock_timestamp();
+BEGIN
+    INSERT INTO Claim_A (PolicyID, Type, Status, ClaimedAmount)
+    VALUES (10, 'Health', 'Pending', 5000);
+
+    PERFORM dblink_exec('proj_link',
+        'BEGIN; INSERT INTO Payment (PolicyID, Amount) VALUES (10, 5000);
+         PREPARE TRANSACTION ''' || remote_txid || ''';');
+
+    PREPARE TRANSACTION local_txid;
+    COMMIT PREPARED local_txid;
+
+    PERFORM dblink_exec('proj_link',
+        'COMMIT PREPARED ''' || remote_txid || ''';');
+END $$;
+
+The above scripts Guarantee atomic commits between multiple databases
+Prepare transactions means:  locks a transaction pending commit.
+Commit prepared means: finalizes distributed transactions safely.
+
+
+5. Parallel vs Serial Query Execution
+
+It is used to compare performance improvements from parallel processing.
+performance difference between single-threaded and parallel aggregations can be analyzed.
+
+SET max_parallel_workers_per_gather = 0;
+SET max_parallel_workers_per_gather = 8;
+EXPLAIN ANALYZE
+SELECT SUM(ClaimedAmount) FROM Claim_ALL;
+
+
+6. Knowledge Base with Recursive Inference
+This implements transitive reasoning using recursive CTEs (Common Table Expressions).
+This Used here to infer all possible relationships.
+
+
+WITH RECURSIVE isA_chain AS (
+    SELECT s, o AS superclass FROM TRIPLE WHERE p = 'isA'
+    UNION ALL
+    SELECT c.s, t.o FROM isA_chain c
+    JOIN TRIPLE t ON c.superclass = t.s WHERE t.p = 'isA'
+)
+SELECT DISTINCT s AS entity, superclass FROM isA_chain;
+
+
+7. Business Rule Enforcement via Triggers
+This ensures total payments never exceed defined limits
+
+CREATE TABLE BUSINESS_LIMITS (
+    rule_key VARCHAR(64) PRIMARY KEY,
+    threshold NUMERIC(10,2),
+    active CHAR(1) CHECK (active IN ('Y','N'))
+);
+
+CREATE OR REPLACE FUNCTION fn_should_alert(new_amount NUMERIC) RETURNS INT AS $$
+DECLARE total_payment NUMERIC; limit_threshold NUMERIC;
+BEGIN
+  SELECT threshold INTO limit_threshold FROM BUSINESS_LIMITS WHERE active='Y';
+  SELECT SUM(amount) INTO total_payment FROM Payment;
+  IF total_payment + new_amount > limit_threshold THEN
+      RAISE EXCEPTION 'Business limit exceeded';
+  END IF;
+  RETURN 0;
+END; $$ LANGUAGE plpgsql;
+
+Summary
+
+This project integrates distributed features, parallelism, and triggers in PostgreSQL to simulate an enterprise-scale insurance database.
+
