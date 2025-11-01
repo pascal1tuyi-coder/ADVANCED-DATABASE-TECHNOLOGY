@@ -1,0 +1,171 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2709
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww29200\viewh17840\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 \uc0\u55356 \u57314  INSURANCE MANAGEMENT DATABASE SYSTEM (PostgreSQL)\
+==================================================\
+\
+ OVERVIEW\
+------------\
+This project implements a comprehensive Insurance Management System using PostgreSQL.\
+It covers agents, clients, policies, claims, assessments, and payments \'97 with advanced features like triggers, cascading relationships, and analytical views.\
+\
+DATABASE STRUCTURE\
+----------------------\
+\
+AGENT TABLE\
+----------------\
+Stores information about insurance agents.\
+\
+CREATE TABLE Agent (\
+    AgentID SERIAL PRIMARY KEY,\
+    FullName VARCHAR(100) NOT NULL,\
+    Contact VARCHAR(50),\
+    Branch VARCHAR(100),\
+    Experience INT\
+);\
+\
+CLIENT TABLE\
+----------------\
+Stores client personal information.\
+\
+CREATE TABLE Client (\
+    ClientID SERIAL PRIMARY KEY,\
+    FullName VARCHAR(100) NOT NULL,\
+    Contact VARCHAR(50),\
+    Email VARCHAR(100),\
+    Gender VARCHAR(10)\
+);\
+\
+ POLICY TABLE\
+-----------------\
+Represents insurance policies linked to both clients and agents.\
+\
+CREATE TABLE Policy (\
+    PolicyID SERIAL PRIMARY KEY,\
+    ClientID INT REFERENCES Client(ClientID) ON DELETE CASCADE,\
+    AgentID INT REFERENCES Agent(AgentID) ON DELETE SET NULL,\
+    Type VARCHAR(50),\
+    Premium DECIMAL(10,2),\
+    StartDate DATE,\
+    EndDate DATE,\
+    Status VARCHAR(20)\
+);\
+\
+ CLAIM TABLE\
+----------------\
+Records insurance claims associated with policies.\
+\
+CREATE TABLE Claim (\
+    ClaimID SERIAL PRIMARY KEY,\
+    PolicyID INT REFERENCES Policy(PolicyID) ON DELETE CASCADE,\
+    DateFiled DATE,\
+    Type VARCHAR(50),\
+    Status VARCHAR(20),\
+    ClaimedAmount DECIMAL(10,2)\
+);\
+\
+CLAIMASSESSMENT TABLE\
+--------------------------\
+Tracks claim evaluations and officer decisions.\
+\
+CREATE TABLE ClaimAssessment (\
+    AssessmentID SERIAL PRIMARY KEY,\
+    ClaimID INT UNIQUE REFERENCES Claim(ClaimID) ON DELETE CASCADE,\
+    Officer VARCHAR(100),\
+    AssessmentDate DATE,\
+    ApprovedAmount DECIMAL(10,2),\
+    Decision VARCHAR(20)\
+);\
+\
+ PAYMENT TABLE\
+-----------------\
+Manages payments made to clients after claim approval.\
+\
+CREATE TABLE Payment (\
+    PaymentID SERIAL PRIMARY KEY,\
+    ClaimID INT UNIQUE REFERENCES Claim(ClaimID) ON DELETE CASCADE,\
+    Amount DECIMAL(10,2),\
+    PaymentDate DATE,\
+    Method VARCHAR(20)\
+);\
+\
+CASCADE RULE:\
+ALTER TABLE Payment\
+    DROP CONSTRAINT payment_claimid_fkey,\
+    ADD CONSTRAINT payment_claimid_fkey\
+    FOREIGN KEY (ClaimID) REFERENCES Claim(ClaimID) ON DELETE CASCADE;\
+\
+SAMPLE DATA\
+-----------------\
+Includes sample records for Agents, Clients, Policies, Claims, Assessments, and Payments.\
+\
+DATABASE VIEWS\
+------------------\
+\
+- ApprovedClaimsWithPayments\
+Displays all approved claims that have corresponding payment details.\
+\
+- AgentHighestPolicyValue\
+Identifies the top-performing agent based on total policy premiums handled.\
+\
+- ClaimApprovalRate\
+Shows the percentage of claims by decision type (Approved, Pending, etc.).\
+\
+ TRIGGERS AND FUNCTIONS\
+--------------------------\
+\
+Auto-close Policy After Claim Closure\
+Automatically updates a policy\'92s status to \'91Closed\'92 when its related claim is closed.\
+\
+CREATE OR REPLACE FUNCTION update_policy_status()\
+RETURNS TRIGGER AS $$\
+BEGIN\
+    UPDATE Policy\
+    SET Status = 'Closed'\
+    WHERE PolicyID = (SELECT PolicyID FROM Claim WHERE ClaimID = NEW.ClaimID);\
+    RETURN NEW;\
+END;\
+$$ LANGUAGE plpgsql;\
+\
+CREATE TRIGGER trg_update_policy_status\
+AFTER UPDATE OF Status ON Claim\
+FOR EACH ROW\
+WHEN (NEW.Status = 'Closed')\
+EXECUTE FUNCTION update_policy_status();\
+\
+ KEY FEATURES\
+----------------\
+*Relational Design with cascading updates/deletes  \
+*Trigger Automation for data consistency  \
+*Analytical Views for reporting  \
+*Sample Data for testing  \
+*Scalable schema for real-world insurance systems  \
+\
+ EXAMPLE QUERY RESULTS\
+-------------------------\
+View: ClaimApprovalRate\
+\
+| Decision  | Total | Percentage |\
+|------------|--------|-------------|\
+| Approved   | 4      | 80.00%      |\
+| Pending    | 1      | 20.00%      |\
+\
+HOW TO RUN\
+--------------\
+1. Open pgAdmin or psql terminal.  \
+2. Create a new database:  \
+   CREATE DATABASE InsuranceDB;\
+3. Connect to it:  \
+   \\c InsuranceDB;\
+4. Run the full SQL script.  \
+5. Explore data using:\
+   SELECT * FROM ApprovedClaimsWithPayments;\
+   SELECT * FROM AgentHighestPolicyValue;\
+   SELECT * FROM ClaimApprovalRate;\
+\
+\
+}
