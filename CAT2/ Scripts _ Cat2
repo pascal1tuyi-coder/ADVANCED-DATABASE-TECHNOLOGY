@@ -1,0 +1,425 @@
+
+
+-- -- 1. Create roles (users) with passwords
+CREATE ROLE BranchDB_A LOGIN PASSWORD 'Pas12@gs';
+CREATE ROLE BranchDB_B LOGIN PASSWORD 'Pas12@gs';
+
+-- -- 2. Optionally create separate databases for each branch
+CREATE DATABASE BranchDB_A OWNER BranchDB_A;
+CREATE DATABASE BranchDB_B OWNER BranchDB_B;
+
+-- 3. Grant privileges
+--\c BranchDB_A
+GRANT CREATE, CONNECT, TEMPORARY ON DATABASE BranchDB_A TO BranchDB_A;
+
+--\c BranchDB_B
+GRANT CREATE, CONNECT, TEMPORARY ON DATABASE BranchDB_B TO BranchDB_B;
+
+-- 4. (Optional) If you want them to create views, tables, etc., grant schema-level rights
+--\c BranchDB_A
+GRANT ALL PRIVILEGES ON SCHEMA public TO BranchDB_A;
+
+--\c BranchDB_B
+GRANT ALL PRIVILEGES ON SCHEMA public TO BranchDB_B;
+
+CREATE TABLE Agent (
+    AgentID SERIAL PRIMARY KEY,
+    FullName VARCHAR(100) NOT NULL,
+    Contact VARCHAR(50),
+    Branch VARCHAR(100),
+    Experience INT
+);
+
+CREATE TABLE Client (
+    ClientID SERIAL PRIMARY KEY,
+    FullName VARCHAR(100) NOT NULL,
+    Contact VARCHAR(50),
+    Email VARCHAR(100),
+    Gender VARCHAR(10)
+);
+
+
+CREATE TABLE Policy (
+    PolicyID SERIAL PRIMARY KEY,
+    ClientID INT REFERENCES Client(ClientID) ON DELETE CASCADE,
+    AgentID INT REFERENCES Agent(AgentID) ON DELETE SET NULL,
+    Type VARCHAR(50),
+    Premium DECIMAL(10,2),
+    StartDate DATE,
+    EndDate DATE,
+    Status VARCHAR(20)
+);
+
+CREATE TABLE Claim (
+    ClaimID SERIAL PRIMARY KEY,
+    PolicyID INT REFERENCES Policy(PolicyID) ON DELETE CASCADE,
+    DateFiled DATE,
+    Type VARCHAR(50),
+    Status VARCHAR(20),
+    ClaimedAmount DECIMAL(10,2)
+);
+
+CREATE TABLE ClaimAssessment (
+    AssessmentID SERIAL PRIMARY KEY,
+    ClaimID INT UNIQUE REFERENCES Claim(ClaimID) ON DELETE CASCADE,
+    Officer VARCHAR(100),
+    AssessmentDate DATE,
+    ApprovedAmount DECIMAL(10,2),
+    Decision VARCHAR(20)
+);
+
+CREATE TABLE Payment (
+    PaymentID SERIAL PRIMARY KEY,
+    ClaimID INT UNIQUE REFERENCES Claim(ClaimID) ON DELETE CASCADE,
+    Amount DECIMAL(10,2),
+    PaymentDate DATE,
+    Method VARCHAR(20)
+);
+
+INSERT INTO Agent (FullName, Contact, Branch, Experience) VALUES
+('John Doe', '0789000001', 'Kigali', 5);
+
+INSERT INTO Client (FullName, Contact, Email, Gender) VALUES
+('Alice N.', '0788000001', 'alice@gmail.com', 'F'),
+('Brian M.', '0788000002', 'brian@gmail.com', 'M');
+
+INSERT INTO Policy (ClientID, AgentID, Type, Premium, StartDate, EndDate, Status) VALUES
+(1, 1, 'Health', 200000, '2025-01-01', '2026-01-01', 'Active'),
+(2, 1, 'Auto', 150000, '2025-02-01', '2026-02-01', 'Active');
+
+-- Connect to BranchDB_A
+--\c BranchDB_A;
+ALTER USER postgres WITH PASSWORD 'Pas12@gus';
+
+-- =========================================
+-- STEP 1: Enable the dblink extension
+-- =========================================
+CREATE EXTENSION IF NOT EXISTS dblink;
+
+-- =========================================
+-- STEP 2: Create connection from BranchDB_A to BranchDB_B
+-- =========================================
+SELECT dblink_connect(
+    'BranchB_Link',
+    'host=localhost dbname=BranchDB_B user=postgres password=Pas12@gs'
+);
+
+SELECT *
+FROM dblink_connect('BranchB_Link', 'SELECT * FROM Agent')
+AS RemoteAgent(AgentID INT, FullName VARCHAR(100), Contact VARCHAR(50), Branch VARCHAR(100), Experience INT);
+
+SELECT * FROM AGENT;
+
+-- Confirm it’s connected
+SELECT dblink_get_connections();
+
+-- SELECT * FROM AGENT;
+-- SELECT * FROM BranchDB_B . Agent;
+
+---retrieve all agents in BranchDB_B:
+SELECT *
+FROM dblink('BranchB_Link', 'SELECT AgentID, FullName, Contact, Branch, Experience FROM Agent')
+AS RemoteAgent(
+    AgentID INT, 
+    FullName VARCHAR(100), 
+    Contact VARCHAR(50), 
+    Branch VARCHAR(100), 
+    Experience INT
+);
+
+-- Combine local Agent table and remote Agent table
+
+SELECT a.AgentID, a.FullName, a.Branch
+FROM Agent a
+UNION ALL
+SELECT b.AgentID, b.FullName, b.Branch
+FROM dblink('BranchB_Link', 'SELECT AgentID, FullName, Branch FROM Agent')
+AS b(AgentID INT, FullName VARCHAR(100), Branch VARCHAR(100));
+
+---Find all policies handled by agents from both branches.
+
+SELECT a.FullName AS AgentName, p.Type AS PolicyType, p.Premium
+FROM Agent a
+JOIN Policy p ON a.AgentID = p.AgentID
+
+UNION ALL
+
+SELECT b.FullName AS AgentName, b.Type AS PolicyType, b.Premium
+FROM dblink(
+    'host=localhost dbname=BranchDB_B user=postgres password=Pas12@gs',
+    'SELECT a.FullName, p.Type, p.Premium
+     FROM Agent a
+     JOIN Policy p ON a.AgentID = p.AgentID'
+) AS b(FullName VARCHAR(100), Type VARCHAR(50), Premium DECIMAL(10,2));
+
+
+SET max_prepared_transactions = 4; 
+
+
+
+DO $main$
+DECLARE
+    local_policy_id INT;   -- Variable for local insert
+    remote_sql TEXT;       -- SQL command for remote insert
+    local_gid TEXT;        -- Global transaction ID for local node
+    remote_gid TEXT;       -- Global transaction ID for remote node
+BEGIN
+    -- 1️⃣ Insert locally (BranchDB_A)
+    INSERT INTO Policy (ClientID, AgentID, Type, Premium, StartDate, EndDate, Status)
+    VALUES (1, 1, 'Distributed-Test', 99999, CURRENT_DATE, CURRENT_DATE + INTERVAL '1 year', 'Pending')
+    RETURNING PolicyID INTO local_policy_id;
+
+    -- 2️ Create unique IDs for both sides
+    local_gid := format('local_tx_%s', local_policy_id);
+    remote_gid := format('remote_tx_%s', local_policy_id);
+
+    -- Prepare remote insert into BranchDB_B
+    remote_sql := format($rmt$
+        BEGIN;
+        INSERT INTO Claim (PolicyID, DateFiled, Type, Status, ClaimedAmount)
+        VALUES (%L, CURRENT_DATE, 'Linked', 'Pending', 10000);
+        PREPARE TRANSACTION %L;
+    $rmt$, local_policy_id, remote_gid);
+
+    -- 4️Run the remote insert
+    PERFORM dblink_exec(
+        'host=localhost dbname=BranchDB_B user=postgres password=Pas12@gs',
+        remote_sql
+    );
+
+    -- 5️ Prepare local transaction
+    PREPARE TRANSACTION local_gid;
+
+    RAISE NOTICE 'Both inserts prepared successfully: %, %', local_gid, remote_gid;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Transaction failed: %', SQLERRM;
+        ROLLBACK;
+END;
+$main$;
+
+
+---QUESTION 6
+---Ensure you have a shared table
+
+CREATE TABLE account_balance (
+    id SERIAL PRIMARY KEY,
+    branch TEXT,
+    balance NUMERIC(10,2)
+);
+
+INSERT INTO account_balance (branch, balance) VALUES
+('Shared', 1000.00);
+
+BEGIN;
+UPDATE account_balance
+SET balance = balance - 100
+WHERE id = 1;
+
+SELECT
+  l.pid,
+  a.usename,
+  a.datname,
+  l.locktype,
+  l.mode,
+  l.granted,
+  a.query,
+  a.state,
+  a.application_name
+FROM pg_locks l
+JOIN pg_stat_activity a ON l.pid = a.pid
+WHERE a.datname IN ('branchdb_a', 'branchdb_b')
+ORDER BY a.pid;
+
+
+---Resolve conflict
+
+COMMIT;
+SELECT * FROM account_balance
+
+
+---Detect blocking relationships
+
+SELECT
+  blocked_l.pid     AS blocked_pid,
+  blocked_a.query   AS blocked_query,
+  blocking_l.pid    AS blocking_pid,
+  blocking_a.query  AS blocking_query
+FROM pg_locks blocked_l
+JOIN pg_stat_activity blocked_a ON blocked_l.pid = blocked_a.pid
+JOIN pg_locks blocking_l ON (
+    blocking_l.locktype = blocked_l.locktype
+    AND blocking_l.database IS NOT DISTINCT FROM blocked_l.database
+    AND blocking_l.relation IS NOT DISTINCT FROM blocked_l.relation
+    AND blocking_l.page IS NOT DISTINCT FROM blocked_l.page
+    AND blocking_l.tuple IS NOT DISTINCT FROM blocked_l.tuple
+    AND blocking_l.virtualxid IS NOT DISTINCT FROM blocked_l.virtualxid
+    AND blocking_l.transactionid IS NOT DISTINCT FROM blocked_l.transactionid
+    AND blocking_l.classid IS NOT DISTINCT FROM blocked_l.classid
+    AND blocking_l.objid IS NOT DISTINCT FROM blocked_l.objid
+    AND blocking_l.objsubid IS NOT DISTINCT FROM blocked_l.objsubid
+)
+JOIN pg_stat_activity blocking_a ON blocking_l.pid = blocking_a.pid
+WHERE NOT blocked_l.granted;
+
+---Simulated a lock conflict between two nodes (BranchDB_A & BranchDB_B).
+
+---Verified it using pg_locks and pg_stat_activity (equivalent to Oracle DBA_LOCKS).
+
+---Interpreted the blocking and waiting relationships.
+
+---7 Perform parallel data aggregation or loading using
+----PARALLEL DML. Compare runtime and document
+---improvement in query cost and execution time.
+
+
+--Parallel Data Aggregation
+
+-- Enable parallelism globally
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+
+-- Create a large table to aggregate
+CREATE TABLE policy_large AS
+SELECT *
+FROM generate_series(1, 5000000) AS id
+CROSS JOIN LATERAL (
+    VALUES (
+        (random() * 100000)::int,
+        (random() * 500)::int,
+        (random() * 1000)::numeric(10,2)
+    )
+) AS t(client_id, agent_id, premium);
+
+ANALYZE policy_large;
+
+---Normal Aggregation (No Parallel)
+EXPLAIN ANALYZE
+SELECT agent_id, SUM(premium) AS total_premium
+FROM policy_large
+GROUP BY agent_id;
+
+
+-----Parallel Data Loading (INSERT … SELECT)
+
+
+-- Target table
+CREATE TABLE policy_summary (
+    agent_id INT,
+    total_premium NUMERIC(12,2)
+);
+
+-- Parallelized insert using SELECT
+
+-- Target table
+CREATE TABLE policy_summary (
+    agent_id INT,
+    total_premium NUMERIC(12,2)
+);
+
+-- Parallelized insert using SELECT
+INSERT INTO policy_summary (agent_id, total_premium)
+SELECT agent_id, SUM(premium)
+FROM policy_large
+GROUP BY agent_id;
+
+SELECT pid, query, backend_type
+FROM pg_stat_activity
+WHERE query ILIKE '%policy_large%'
+  AND backend_type IN ('parallel worker', 'parallel apply worker');
+
+-- ---Draw and explain a three-tier architecture for your project
+-- (Presentation, Application, Database). Show data flow and
+-- interaction with database links.
+---q8
+-09
+-- Local table (BranchDB_A)
+SELECT * FROM Agent;
+
+-- Remote table (BranchDB_B via dblink)
+SELECT dblink_connect(
+  'BranchB_Link',
+  'host=localhost dbname=BranchDB_B user=postgres password=Pas12@gs'
+);
+
+-- Now you can use this
+SELECT *
+FROM dblink('BranchB_Link', 'SELECT AgentID, FullName, Branch FROM Agent')
+AS RemoteAgent(AgentID INT, FullName VARCHAR(100), Branch VARCHAR(100));
+
+
+SELECT dblink_disconnect('BranchB_Link');
+
+---distributed join query
+
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS)
+SELECT a.AgentID, a.FullName, p.Type, p.Premium
+FROM Agent a
+JOIN Policy p ON a.AgentID = p.AgentID
+UNION ALL
+SELECT b.AgentID, b.FullName, b.Type, b.Premium
+FROM dblink(
+  'BranchB_Link',
+  'SELECT a.AgentID, a.FullName, p.Type, p.Premium
+   FROM Agent a
+   JOIN Policy p ON a.AgentID = p.AgentID'
+) AS b(AgentID INT, FullName VARCHAR(100), Type VARCHAR(50), Premium DECIMAL(10,2));
+
+---Remote Join Pushed to Remote Node
+
+SELECT a.AgentID, a.FullName, p.Type, p.Premium
+FROM Agent a
+JOIN Policy p ON a.AgentID = p.AgentID;
+
+EXPLAIN (ANALYZE, VERBOSE, COSTS)
+SELECT a.AgentID, a.FullName, p.Type, p.Premium
+FROM Agent a
+JOIN Policy p ON a.AgentID = p.AgentID
+UNION ALL
+SELECT b.AgentID, b.FullName, b.Type, b.Premium
+FROM dblink(
+  'host=localhost dbname=BranchDB_B user=postgres password=Pas12@gs',
+  'SELECT a.AgentID, a.FullName, p.Type, p.Premium
+   FROM Agent a
+   JOIN Policy p ON a.AgentID = p.AgentID'
+) AS b(AgentID INT, FullName VARCHAR(100), Type VARCHAR(50), Premium DECIMAL(10,2));
+
+
+--10
+
+--Experimental Setup
+SELECT a.FullName, COUNT(p.PolicyID) AS NumPolicies, SUM(p.Premium) AS TotalPremium
+FROM Agent a
+JOIN  Policy p ON a.AgentID = p.AgentID
+JOIN Client c ON p.ClientID = c.ClientID
+GROUP BY a.FullName;
+
+
+--CENTRALIZED EXECUTION
+
+SET AUTOTRACE ON;
+
+SELECT a.FullName, COUNT(p.PolicyID), SUM(p.Premium)
+FROM Agent a
+JOIN Policy p ON a.AgentID = p.AgentID
+JOIN Client c ON p.ClientID = c.ClientID
+GROUP BY a.FullName;
+
+ALTER SESSION ENABLE PARALLEL DML;
+ALTER TABLE Policy PARALLEL 4;
+ALTER TABLE Agent PARALLEL 4;
+ALTER TABLE Client PARALLEL 4;
+
+EXPLAIN PLAN FOR
+SELECT /*+ PARALLEL(4) */ a.FullName, COUNT(p.PolicyID), SUM(p.Premium)
+FROM Agent a
+JOIN Policy p ON a.AgentID = p.AgentID
+JOIN Client c ON p.ClientID = c.ClientID
+GROUP BY a.FullName;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY());
+
+
+
